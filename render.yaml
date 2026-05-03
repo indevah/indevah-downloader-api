@@ -4,8 +4,10 @@ services:
     env: python
     region: oregon
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --workers 2 --bind 0.0.0.0:$PORT --timeout 120
+    buildCommand: chmod +x build.sh && bash build.sh
+    startCommand: chmod +x start.sh && bash start.sh
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: BGUTIL_PORT
+        value: 4416

@@ -1,9 +1,10 @@
 """
-INDEVAH Downloader — Backend API
-Flask + yt-dlp | Deploy on Render.com free tier
+INDEVAH Downloader — Backend API v3
+Flask + yt-dlp + bgutil PO Token provider
 
-YouTube bot detection fix: uses ios/android/tv_embedded client chain.
-These clients do NOT require sign-in or cookies from datacenter IPs.
+The bgutil HTTP server runs on port 4416 (started by start.sh).
+yt-dlp talks to it automatically via the bgutil-ytdlp-pot-provider plugin.
+This fully bypasses YouTube's "Sign in to confirm you're not a bot" error.
 """
 
 import os, re
@@ -14,11 +15,15 @@ import yt_dlp
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# Port where bgutil PO token server listens
+BGUTIL_PORT = int(os.environ.get('BGUTIL_PORT', 4416))
+BGUTIL_URL  = f'http://127.0.0.1:{BGUTIL_PORT}'
+
 
 # ─── HEALTH CHECKS ────────────────────────────────────────────────────────────
 @app.route('/', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "service": "INDEVAH Downloader API", "version": "2.1"})
+    return jsonify({"status": "ok", "service": "INDEVAH Downloader API", "version": "3.0"})
 
 @app.route('/ping', methods=['GET'])
 def ping():
@@ -26,7 +31,7 @@ def ping():
 
 @app.route('/info', methods=['GET'])
 def info_get():
-    return jsonify({"status": "ok", "message": "POST {\"url\": \"https://...\"} to this endpoint"})
+    return jsonify({"status": "ok", "message": 'POST {"url":"https://..."} to this endpoint'})
 
 
 # ─── INFO ENDPOINT ────────────────────────────────────────────────────────────
@@ -43,31 +48,18 @@ def get_info():
     if not url.startswith(('http://', 'https://')):
         return jsonify({'error': 'Invalid URL — must start with https://'}), 400
 
-    info, err = try_extract(url)
+    info, err = extract(url)
     if info is None:
         return jsonify({'error': err or 'Could not extract media info'}), 400
 
     return jsonify(build_response(info, url))
 
 
-# ─── EXTRACTION WITH YOUTUBE BOT BYPASS ───────────────────────────────────────
-def try_extract(url):
-    """
-    Try multiple yt-dlp client strategies.
-
-    For YouTube, datacenter IPs get flagged with "Sign in to confirm not a bot"
-    when using the default 'web' client. The fix is to use mobile/TV clients:
-
-      - ios:         YouTube iOS app client — no bot check enforced
-      - android:     YouTube Android app client — no bot check enforced
-      - tv_embedded: YouTube Smart TV embed — no sign-in required at all
-      - mweb:        YouTube mobile web — lighter bot enforcement
-
-    We try each in order and return on first success.
-    """
+# ─── EXTRACTION ───────────────────────────────────────────────────────────────
+def extract(url):
     is_yt = any(x in url for x in ['youtube.com', 'youtu.be'])
 
-    common = {
+    common_opts = {
         'quiet':             True,
         'no_warnings':       True,
         'skip_download':     True,
@@ -85,65 +77,68 @@ def try_extract(url):
     }
 
     if is_yt:
-        strategies = [
-            # ── Best: ios client — bypasses bot check, gives good format list
-            {**common, 'extractor_args': {
-                'youtube': {'player_client': ['ios']}
-            }},
-            # ── android client — also bypasses bot check
-            {**common, 'extractor_args': {
-                'youtube': {'player_client': ['android']}
-            }},
-            # ── tv_embedded — TV embed, no auth required at all
-            {**common, 'extractor_args': {
-                'youtube': {
-                    'player_client': ['tv_embedded'],
-                    'player_skip':   ['webpage', 'configs'],
-                }
-            }},
-            # ── mweb — mobile web fallback
-            {**common, 'extractor_args': {
-                'youtube': {'player_client': ['mweb']}
-            }},
-            # ── ios + mweb combined — last resort
-            {**common, 'extractor_args': {
-                'youtube': {'player_client': ['ios', 'mweb']}
-            }},
-        ]
-    else:
-        # Non-YouTube: single attempt
-        strategies = [common]
+        # Strategy 1 — best: ios client + bgutil POT provider
+        # bgutil plugin auto-attaches if installed; no extra args needed
+        s1 = {**common_opts, 'extractor_args': {
+            'youtube': {'player_client': ['ios']},
+        }}
 
-    BOT_KEYS = ['sign in', 'bot', 'login', 'cookie', 'confirm your age',
-                'not a robot', 'unavailable', 'age-restricted']
+        # Strategy 2 — ios + mweb with explicit bgutil HTTP base_url
+        s2 = {**common_opts, 'extractor_args': {
+            'youtube': {'player_client': ['ios', 'mweb']},
+            'youtubepot-bgutilhttp': {'base_url': [BGUTIL_URL]},
+        }}
+
+        # Strategy 3 — android client (different client signature)
+        s3 = {**common_opts, 'extractor_args': {
+            'youtube': {'player_client': ['android']},
+        }}
+
+        # Strategy 4 — tv_embedded (no sign-in required on TV clients)
+        s4 = {**common_opts, 'extractor_args': {
+            'youtube': {
+                'player_client': ['tv_embedded'],
+                'player_skip':   ['webpage', 'configs'],
+            },
+        }}
+
+        # Strategy 5 — web_creator (less restricted creator-side client)
+        s5 = {**common_opts, 'extractor_args': {
+            'youtube': {'player_client': ['web_creator', 'mweb']},
+            'youtubepot-bgutilhttp': {'base_url': [BGUTIL_URL]},
+        }}
+
+        strategies = [s1, s2, s3, s4, s5]
+    else:
+        strategies = [common_opts]
+
+    BOT_KEYS  = ['sign in', 'bot', 'login', 'cookie', 'confirm your age',
+                 'not a robot', 'age-restricted', 'unavailable']
     last_err  = 'Extraction failed'
 
-    for i, opts in enumerate(strategies):
+    for opts in strategies:
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if info:
-                    return info, None   # ✅ success
+                    return info, None
         except yt_dlp.utils.DownloadError as e:
-            raw   = str(e)
-            clean = re.sub(r'ERROR:\s*', '', raw)
+            clean = re.sub(r'ERROR:\s*', '', str(e))
             clean = re.sub(r'\[[\w:]+\]\s+[\w\-]+:\s*', '', clean).strip()
             last_err = clean[:300]
-            # Only keep retrying for bot/auth errors
             if not any(k in clean.lower() for k in BOT_KEYS):
-                return None, last_err
+                return None, last_err   # non-bot error: stop retrying
         except Exception as e:
             last_err = str(e)[:300]
 
-    # All strategies failed — give a helpful message
-    if any(k in last_err.lower() for k in ['sign in', 'bot', 'not a robot']):
+    # All 5 strategies failed
+    if any(k in last_err.lower() for k in ['sign in', 'bot', 'not a robot', 'confirm']):
         last_err = (
-            'YouTube is blocking this server IP even with mobile clients. '
-            'This is rare but can happen with some videos. '
-            'Please try: another YouTube video, a YouTube Shorts link, '
+            'YouTube bot check could not be bypassed for this video. '
+            'This can happen with certain videos or when the server IP is heavily flagged. '
+            'Please try: a different YouTube video, a YouTube Shorts URL, '
             'or wait a few minutes and try again.'
         )
-
     return None, last_err
 
 
@@ -173,20 +168,20 @@ def download_file():
         r = req.get(dl_url, headers=hdrs, stream=True, timeout=60, allow_redirects=True)
         r.raise_for_status()
 
-        out_headers = {
+        out_hdrs = {
             'Content-Disposition':         f'attachment; filename="{fname}"',
             'Access-Control-Allow-Origin': '*',
         }
         if 'Content-Length' in r.headers:
-            out_headers['Content-Length'] = r.headers['Content-Length']
-        out_headers['Content-Type'] = r.headers.get('Content-Type', 'application/octet-stream')
+            out_hdrs['Content-Length'] = r.headers['Content-Length']
+        out_hdrs['Content-Type'] = r.headers.get('Content-Type', 'application/octet-stream')
 
         def generate():
             for chunk in r.iter_content(chunk_size=8192):
                 if chunk:
                     yield chunk
 
-        return Response(stream_with_context(generate()), headers=out_headers, status=200)
+        return Response(stream_with_context(generate()), headers=out_hdrs, status=200)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -231,17 +226,14 @@ def build_video_formats(info, original_url):
         if h < 144: continue
         vcodec = f.get('vcodec') or 'none'
         if vcodec == 'none': continue
-
         acodec    = f.get('acodec') or 'none'
         has_audio = acodec != 'none'
         quality   = f'{h}p'
         key       = f'{quality}-{"a" if has_audio else "v"}'
         if key in seen: continue
         seen.add(key)
-
         hdr = ('hdr' in (f.get('format_note') or '').lower() or
                'hdr' in (f.get('dynamic_range') or '').lower())
-
         result.append({
             'quality':  quality,
             'label':    (labels.get(h) or quality) + ('' if has_audio else ' (No Audio)'),
@@ -252,7 +244,6 @@ def build_video_formats(info, original_url):
             'url':      make_proxy_url(f.get('url',''), original_url,
                                        f'{quality}{"" if has_audio else "-noaudio"}.mp4'),
         })
-
     result.sort(key=lambda x: (-int(x['quality'][:-1]), -x['hasAudio']))
     return result
 
@@ -260,18 +251,15 @@ def build_video_formats(info, original_url):
 def build_audio_formats(info, original_url):
     formats = info.get('formats') or []
     result, seen = [], set()
-
     for f in formats:
         acodec = f.get('acodec') or 'none'
         vcodec = f.get('vcodec') or 'none'
         if acodec == 'none' or vcodec != 'none': continue
-
         abr      = int(f.get('abr') or 0)
         ext      = (f.get('ext') or 'mp3').lower()
         key      = f'{abr}-{ext}'
         if key in seen: continue
         seen.add(key)
-
         lossless = ext in ('flac', 'wav')
         quality  = 'FLAC' if lossless else (f'{abr}kbps' if abr else 'Best')
         result.append({
@@ -284,14 +272,12 @@ def build_audio_formats(info, original_url):
             'url':      make_proxy_url(f.get('url',''), original_url,
                                        f'{quality}.{"flac" if lossless else "mp3"}'),
         })
-
     if not result and info.get('url'):
         result.append({
-            'quality':'Best', 'label':'Best Available', 'bitrate':'Variable',
-            'lossless':False, 'size':None,
+            'quality':'Best','label':'Best Available','bitrate':'Variable',
+            'lossless':False,'size':None,
             'url': make_proxy_url(info['url'], original_url, 'audio.mp3'),
         })
-
     result.sort(key=lambda x: -(
         int(x['bitrate'].split()[0])
         if x.get('bitrate','').split()[:1] and x['bitrate'].split()[0].isdigit() else 0
@@ -301,7 +287,7 @@ def build_audio_formats(info, original_url):
 
 def build_gif_formats(info, original_url):
     return [{
-        'quality': 'Original', 'label': 'Original GIF',
+        'quality':'Original','label':'Original GIF',
         'fps':  f"{info.get('fps','')}fps" if info.get('fps') else None,
         'size': fmt_size(info.get('filesize')),
         'url':  make_proxy_url(info.get('url',''), original_url, 'animation.gif'),
@@ -350,8 +336,7 @@ def host_from(url):
         from urllib.parse import urlparse
         h = urlparse(url).hostname or ''
         return h.replace('www.','').split('.')[0].capitalize()
-    except:
-        return 'Unknown'
+    except: return 'Unknown'
 
 def _cors_preflight():
     r = Response()
@@ -361,7 +346,7 @@ def _cors_preflight():
     return r, 204
 
 
-# ─── RUN ──────────────────────────────────────────────────────────────────────
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
