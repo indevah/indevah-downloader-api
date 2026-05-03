@@ -1,11 +1,11 @@
 """
-INDEVAH Downloader — Backend API v4
+INDEVAH Downloader — Backend API v5
 Flask + yt-dlp
 
-YouTube: Uses cookies (exported from browser) stored as YOUTUBE_COOKIES env var.
-         Falls back to ios/android clients if no cookies set.
-TikTok:  Uses yt-dlp directly for download URLs with proper headers.
-Others:  Standard yt-dlp extraction.
+Key fix: YouTube/TikTok CDN URLs are signed & expire quickly, and
+require specific user-agents. Instead of storing raw CDN URLs, we
+pass the original page URL + format_id to the /download endpoint,
+which re-extracts the fresh CDN URL at download time.
 """
 
 import os, re, base64, tempfile
@@ -16,116 +16,172 @@ import yt_dlp
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# ── Cookie file setup ────────────────────────────────────────────────────────
-# Store your YouTube cookies.txt content as base64 in YOUTUBE_COOKIES env var
-# on Render. See README for how to export cookies.
 _COOKIE_FILE = None
 
 def get_cookie_file():
-    """Write cookies from env var to a temp file once, reuse path."""
     global _COOKIE_FILE
     if _COOKIE_FILE and os.path.exists(_COOKIE_FILE):
         return _COOKIE_FILE
-
-    cookies_b64 = os.environ.get('YOUTUBE_COOKIES', '').strip()
-    if not cookies_b64:
+    raw = os.environ.get('YOUTUBE_COOKIES', '').strip()
+    if not raw:
         return None
-
     try:
-        # Support both raw cookies.txt content and base64-encoded
         try:
-            cookies_txt = base64.b64decode(cookies_b64).decode('utf-8')
+            txt = base64.b64decode(raw).decode('utf-8')
         except Exception:
-            cookies_txt = cookies_b64   # already plain text
-
+            txt = raw
         tmp = tempfile.NamedTemporaryFile(
             mode='w', suffix='.txt', delete=False, prefix='yt_cookies_'
         )
-        tmp.write(cookies_txt)
-        tmp.flush()
-        tmp.close()
+        tmp.write(txt); tmp.flush(); tmp.close()
         _COOKIE_FILE = tmp.name
-        print(f"[cookies] Loaded cookie file: {_COOKIE_FILE}")
+        print(f'[cookies] Loaded: {_COOKIE_FILE}')
         return _COOKIE_FILE
     except Exception as e:
-        print(f"[cookies] Failed to write cookie file: {e}")
+        print(f'[cookies] Error: {e}')
         return None
 
 
-# ─── HEALTH CHECKS ────────────────────────────────────────────────────────────
+# ─── HEALTH ───────────────────────────────────────────────────────────────────
 @app.route('/', methods=['GET'])
 def health():
-    has_cookies = bool(os.environ.get('YOUTUBE_COOKIES', '').strip())
     return jsonify({
-        "status":      "ok",
-        "service":     "INDEVAH Downloader API",
-        "version":     "4.0",
-        "yt_cookies":  "set" if has_cookies else "not set (YouTube may be blocked)",
+        'status': 'ok', 'version': '5.0',
+        'yt_cookies': 'set' if os.environ.get('YOUTUBE_COOKIES') else 'not set',
     })
 
 @app.route('/ping', methods=['GET'])
 def ping():
-    return jsonify({"status": "ok"})
+    return jsonify({'status': 'ok'})
 
 @app.route('/info', methods=['GET'])
 def info_get():
-    return jsonify({"status": "ok", "usage": 'POST {"url":"https://..."} here'})
+    return jsonify({'status': 'ok', 'usage': 'POST {"url":"https://..."}'})
 
 
-# ─── INFO ENDPOINT ────────────────────────────────────────────────────────────
+# ─── /info — extract metadata & format list ───────────────────────────────────
 @app.route('/info', methods=['POST', 'OPTIONS'])
 def get_info():
     if request.method == 'OPTIONS':
         return _cors_preflight()
-
     data = request.get_json(silent=True)
     if not data or not data.get('url'):
         return jsonify({'error': 'Missing URL'}), 400
-
     url = data['url'].strip()
     if not url.startswith(('http://', 'https://')):
         return jsonify({'error': 'Invalid URL'}), 400
 
-    info, err = extract(url)
+    info, err = do_extract(url)
     if info is None:
         return jsonify({'error': err}), 400
-
     return jsonify(build_response(info, url))
 
 
+# ─── /download — re-extract fresh URL for a specific format_id ───────────────
+@app.route('/download', methods=['GET'])
+def download_file():
+    page_url  = request.args.get('page_url', '').strip()
+    format_id = request.args.get('format_id', 'best').strip()
+    fname     = request.args.get('filename', 'download').strip()
+    site      = request.args.get('site', '').strip().lower()
+
+    if not page_url:
+        return jsonify({'error': 'Missing page_url'}), 400
+
+    import requests as req
+
+    # ── Re-extract fresh CDN URL for the requested format ────────────────────
+    cookie_file = get_cookie_file()
+    is_yt = any(x in page_url for x in ['youtube.com', 'youtu.be'])
+
+    ydl_opts = {
+        'quiet':         True,
+        'no_warnings':   True,
+        'noplaylist':    True,
+        'format':        format_id,
+        'socket_timeout': 20,
+        'http_headers': _ua_headers(site or ('youtube' if is_yt else '')),
+    }
+    if cookie_file and is_yt:
+        ydl_opts['cookiefile'] = cookie_file
+    if is_yt:
+        ydl_opts['extractor_args'] = {'youtube': {'player_client': ['ios']}}
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(page_url, download=False)
+            cdn_url = info.get('url') or (
+                info.get('requested_formats', [{}])[0].get('url') if info.get('requested_formats') else None
+            )
+        if not cdn_url:
+            return jsonify({'error': 'Could not get download URL for this format'}), 400
+    except Exception as e:
+        return jsonify({'error': f'Re-extraction failed: {str(e)[:200]}'}), 500
+
+    # ── Stream the CDN URL to the browser ────────────────────────────────────
+    hdrs = _ua_headers(site or ('youtube' if is_yt else ''))
+    if page_url:
+        hdrs['Referer'] = page_url
+
+    try:
+        r = req.get(cdn_url, headers=hdrs, stream=True, timeout=60, allow_redirects=True)
+        r.raise_for_status()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    out_hdrs = {
+        'Content-Disposition':         f'attachment; filename="{fname}"',
+        'Access-Control-Allow-Origin': '*',
+        'Content-Type': r.headers.get('Content-Type', 'application/octet-stream'),
+    }
+    if 'Content-Length' in r.headers:
+        out_hdrs['Content-Length'] = r.headers['Content-Length']
+
+    def generate():
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                yield chunk
+
+    return Response(stream_with_context(generate()), headers=out_hdrs, status=200)
+
+
 # ─── EXTRACTION ───────────────────────────────────────────────────────────────
-def extract(url):
+def do_extract(url):
     is_yt     = any(x in url for x in ['youtube.com', 'youtu.be'])
     is_tiktok = 'tiktok.com' in url
+    cookie_file = get_cookie_file()
 
-    base_opts = {
+    base = {
         'quiet':             True,
         'no_warnings':       True,
         'skip_download':     True,
         'noplaylist':        True,
         'socket_timeout':    30,
         'extractor_retries': 2,
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
-            ),
-            'Accept-Language': 'en-US,en;q=0.9',
-        },
+        'http_headers':      _ua_headers('youtube' if is_yt else ('tiktok' if is_tiktok else '')),
     }
 
-    cookie_file = get_cookie_file()
+    strategies = []
 
     if is_yt:
-        strategies = _yt_strategies(base_opts, cookie_file)
+        # With cookies — most reliable
+        if cookie_file:
+            strategies.append({**base, 'cookiefile': cookie_file})
+            strategies.append({**base, 'cookiefile': cookie_file,
+                                'extractor_args': {'youtube': {'player_client': ['ios']}}})
+        # Without cookies — mobile clients
+        for client in ['ios', 'android', 'tv_embedded', 'android_vr']:
+            opts = {**base, 'extractor_args': {'youtube': {'player_client': [client]}}}
+            if client == 'tv_embedded':
+                opts['extractor_args']['youtube']['player_skip'] = ['webpage', 'configs']
+            strategies.append(opts)
     elif is_tiktok:
-        strategies = _tiktok_strategies(base_opts)
+        strategies = [{**base, 'http_headers': _ua_headers('tiktok')}, base]
     else:
-        strategies = [base_opts]
+        strategies = [base]
 
-    BOT_KEYS = ['sign in', 'bot', 'login', 'cookie', 'confirm your age',
-                'not a robot', 'age-restricted']
+    BOT_KEYS = ['sign in', 'bot', 'login', 'cookie', 'not a robot',
+                'confirm your age', 'age-restricted']
     last_err  = 'Could not extract media info'
 
     for opts in strategies:
@@ -138,165 +194,25 @@ def extract(url):
             clean = re.sub(r'ERROR:\s*', '', str(e))
             clean = re.sub(r'\[[\w:]+\]\s+[\w\-]+:\s*', '', clean).strip()
             last_err = clean[:300]
-            # Stop retrying if it's not a bot/auth error
             if not any(k in clean.lower() for k in BOT_KEYS):
                 return None, last_err
         except Exception as e:
             last_err = str(e)[:300]
 
-    # All strategies exhausted
+    # Give a helpful final message
     if is_yt and any(k in last_err.lower() for k in ['sign in', 'bot', 'not a robot']):
         if not cookie_file:
             last_err = (
-                'YouTube is blocking this server\'s IP. '
-                'Fix: Add your YouTube cookies to Render. '
-                'Go to your Render dashboard → Environment → add variable '
-                'YOUTUBE_COOKIES with the content of your cookies.txt file. '
-                'See the README for step-by-step instructions.'
+                'YouTube is blocking this server. Add your YouTube cookies: '
+                'Render dashboard → Environment → YOUTUBE_COOKIES. See README.'
             )
         else:
             last_err = (
                 'YouTube rejected the cookies. '
-                'Your cookies may have expired — please re-export them from your browser '
-                'and update the YOUTUBE_COOKIES environment variable on Render.'
+                'They may have expired — re-export from your browser and update '
+                'the YOUTUBE_COOKIES variable on Render.'
             )
-
     return None, last_err
-
-
-def _yt_strategies(base_opts, cookie_file):
-    """Build YouTube extraction strategies, cookies-first."""
-    strategies = []
-
-    # ── With cookies (most reliable if set) ──────────────────────────────────
-    if cookie_file:
-        strategies.append({
-            **base_opts,
-            'cookiefile': cookie_file,
-            # Default web client with cookies passes bot check
-        })
-        strategies.append({
-            **base_opts,
-            'cookiefile': cookie_file,
-            'extractor_args': {'youtube': {'player_client': ['ios']}},
-        })
-
-    # ── Without cookies: mobile/TV clients ───────────────────────────────────
-    strategies += [
-        # ios — Apple mobile app client, least bot-checked
-        {**base_opts, 'extractor_args': {
-            'youtube': {'player_client': ['ios']}
-        }},
-        # android
-        {**base_opts, 'extractor_args': {
-            'youtube': {'player_client': ['android']}
-        }},
-        # tv_embedded — Smart TV, no sign-in enforcement
-        {**base_opts, 'extractor_args': {
-            'youtube': {
-                'player_client': ['tv_embedded'],
-                'player_skip':   ['webpage', 'configs'],
-            }
-        }},
-        # android_vr — VR headset client, rarely blocked
-        {**base_opts, 'extractor_args': {
-            'youtube': {'player_client': ['android_vr']}
-        }},
-    ]
-    return strategies
-
-
-def _tiktok_strategies(base_opts):
-    """TikTok needs a mobile user agent to get working CDN URLs."""
-    mobile_opts = {
-        **base_opts,
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
-                'AppleWebKit/605.1.15 (KHTML, like Gecko) '
-                'Version/17.0 Mobile/15E148 Safari/604.1'
-            ),
-            'Referer':        'https://www.tiktok.com/',
-            'Accept-Language': 'en-US,en;q=0.9',
-        },
-        # Tell yt-dlp to get direct CDN URL without extra processing
-        'extractor_args': {
-            'tiktok': {'webpage_download': ['0']}
-        },
-    }
-    return [mobile_opts, base_opts]
-
-
-# ─── DOWNLOAD PROXY ───────────────────────────────────────────────────────────
-@app.route('/download', methods=['GET'])
-def download_file():
-    dl_url  = request.args.get('url', '').strip()
-    referer = request.args.get('ref', '').strip()
-    fname   = request.args.get('filename', 'download').strip()
-    site    = request.args.get('site', '').strip().lower()
-
-    if not dl_url or not dl_url.startswith(('http://', 'https://')):
-        return jsonify({'error': 'Invalid download URL'}), 400
-
-    import requests as req
-
-    # Build appropriate headers per platform
-    if 'tiktok' in dl_url or site == 'tiktok':
-        hdrs = {
-            'User-Agent': (
-                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
-                'AppleWebKit/605.1.15 (KHTML, like Gecko) '
-                'Version/17.0 Mobile/15E148 Safari/604.1'
-            ),
-            'Referer':         'https://www.tiktok.com/',
-            'Accept':          'video/webm,video/mp4,video/*;q=0.9,*/*;q=0.8',
-            'Accept-Encoding': 'identity',
-            'Range':           'bytes=0-',
-        }
-    elif 'googlevideo' in dl_url or 'youtube' in (referer or ''):
-        hdrs = {
-            'User-Agent': (
-                'com.google.android.youtube/17.36.4 '
-                '(Linux; U; Android 12; GB) gzip'
-            ),
-            'Accept':          '*/*',
-            'Accept-Encoding': 'identity',
-        }
-    else:
-        hdrs = {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/124.0.0.0 Safari/537.36'
-            ),
-            'Accept':          '*/*',
-            'Accept-Encoding': 'identity',
-        }
-
-    if referer:
-        hdrs['Referer'] = referer
-
-    try:
-        r = req.get(dl_url, headers=hdrs, stream=True, timeout=60, allow_redirects=True)
-        r.raise_for_status()
-
-        out_hdrs = {
-            'Content-Disposition':         f'attachment; filename="{fname}"',
-            'Access-Control-Allow-Origin': '*',
-        }
-        if 'Content-Length' in r.headers:
-            out_hdrs['Content-Length'] = r.headers['Content-Length']
-        out_hdrs['Content-Type'] = r.headers.get('Content-Type', 'application/octet-stream')
-
-        def generate():
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    yield chunk
-
-        return Response(stream_with_context(generate()), headers=out_hdrs, status=200)
-
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 
 # ─── BUILD RESPONSE ───────────────────────────────────────────────────────────
@@ -329,14 +245,13 @@ def detect_type(info):
 
 
 def build_video_formats(info, original_url, is_tiktok=False):
-    formats = info.get('formats') or []
+    formats   = info.get('formats') or []
     result, seen = [], set()
-    labels = {
+    site      = 'tiktok' if is_tiktok else ''
+    labels    = {
         2160:'4K Ultra HD', 1440:'2K QHD', 1080:'Full HD',
         720:'HD', 480:'Standard', 360:'Low Quality', 240:'Very Low', 144:'Minimal',
     }
-    site_param = 'tiktok' if is_tiktok else ''
-
     for f in formats:
         h = f.get('height') or 0
         if h < 144: continue
@@ -348,8 +263,9 @@ def build_video_formats(info, original_url, is_tiktok=False):
         key       = f'{quality}-{"a" if has_audio else "v"}'
         if key in seen: continue
         seen.add(key)
-        hdr = ('hdr' in (f.get('format_note') or '').lower() or
-               'hdr' in (f.get('dynamic_range') or '').lower())
+        fid  = f.get('format_id', quality)
+        hdr  = ('hdr' in (f.get('format_note') or '').lower() or
+                'hdr' in (f.get('dynamic_range') or '').lower())
         fname = f'{quality}{"" if has_audio else "-noaudio"}.mp4'
         result.append({
             'quality':  quality,
@@ -358,9 +274,8 @@ def build_video_formats(info, original_url, is_tiktok=False):
             'hdr':      hdr,
             'hasAudio': has_audio,
             'size':     fmt_size(f.get('filesize') or f.get('filesize_approx')),
-            'url':      make_proxy_url(f.get('url',''), original_url, fname, site_param),
+            'url':      make_dl_url(original_url, fid, fname, site),
         })
-
     result.sort(key=lambda x: (-int(x['quality'][:-1]), -x['hasAudio']))
     return result
 
@@ -379,6 +294,7 @@ def build_audio_formats(info, original_url):
         seen.add(key)
         lossless = ext in ('flac', 'wav')
         quality  = 'FLAC' if lossless else (f'{abr}kbps' if abr else 'Best')
+        fid      = f.get('format_id', quality)
         result.append({
             'quality':  quality,
             'label':    ('Lossless ' + ext.upper()) if lossless else
@@ -386,13 +302,15 @@ def build_audio_formats(info, original_url):
             'bitrate':  f'{abr} kbps' if abr else 'Variable',
             'lossless': lossless,
             'size':     fmt_size(f.get('filesize') or f.get('filesize_approx')),
-            'url':      make_proxy_url(f.get('url',''), original_url,
-                                       f'{quality}.{"flac" if lossless else "mp3"}'),
+            'url':      make_dl_url(original_url, fid,
+                                    f'{quality}.{"flac" if lossless else "mp3"}'),
         })
-    if not result and info.get('url'):
-        result.append({'quality':'Best','label':'Best Available','bitrate':'Variable',
-                       'lossless':False,'size':None,
-                       'url':make_proxy_url(info['url'], original_url, 'audio.mp3')})
+    if not result:
+        result.append({
+            'quality': 'Best', 'label': 'Best Available Audio',
+            'bitrate': 'Variable', 'lossless': False, 'size': None,
+            'url': make_dl_url(original_url, 'bestaudio', 'audio.mp3'),
+        })
     result.sort(key=lambda x: -(
         int(x['bitrate'].split()[0])
         if x.get('bitrate','').split()[:1] and x['bitrate'].split()[0].isdigit() else 0
@@ -401,19 +319,50 @@ def build_audio_formats(info, original_url):
 
 
 def build_gif_formats(info, original_url):
+    fid = (info.get('formats') or [{}])[0].get('format_id', 'best')
     return [{'quality':'Original','label':'Original GIF',
              'fps': f"{info.get('fps','')}fps" if info.get('fps') else None,
              'size': fmt_size(info.get('filesize')),
-             'url': make_proxy_url(info.get('url',''), original_url, 'animation.gif')}]
+             'url': make_dl_url(original_url, fid, 'animation.gif')}]
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
-def make_proxy_url(direct_url, referer, filename, site=''):
-    if not direct_url: return ''
+def make_dl_url(page_url, format_id, filename, site=''):
     from urllib.parse import quote
     base = request.host_url.rstrip('/')
-    s = f'&site={quote(site)}' if site else ''
-    return f"{base}/download?url={quote(direct_url)}&ref={quote(referer)}&filename={quote(filename)}{s}"
+    s    = f'&site={quote(site)}' if site else ''
+    return (f"{base}/download"
+            f"?page_url={quote(page_url)}"
+            f"&format_id={quote(str(format_id))}"
+            f"&filename={quote(filename)}{s}")
+
+def _ua_headers(site=''):
+    if site == 'tiktok':
+        return {
+            'User-Agent': (
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+                'AppleWebKit/605.1.15 (KHTML, like Gecko) '
+                'Version/17.0 Mobile/15E148 Safari/604.1'
+            ),
+            'Referer': 'https://www.tiktok.com/',
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+    if site in ('youtube', 'youtu'):
+        return {
+            'User-Agent': (
+                'com.google.android.youtube/17.36.4 '
+                '(Linux; U; Android 12; GB) gzip'
+            ),
+            'Accept-Language': 'en-US,en;q=0.9',
+        }
+    return {
+        'User-Agent': (
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/124.0.0.0 Safari/537.36'
+        ),
+        'Accept-Language': 'en-US,en;q=0.9',
+    }
 
 def clean_codec(s):
     s = (s or '').lower()
@@ -459,8 +408,6 @@ def _cors_preflight():
     r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     return r, 204
 
-
-# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, debug=False)
